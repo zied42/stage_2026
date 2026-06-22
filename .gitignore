@@ -1,0 +1,17 @@
+# raw datasets
+raw_data/
+*.json
+
+# python cache
+__pycache__/
+*.pyc
+
+# virtual env
+venv/
+.env
+
+# aggregated outputs
+topics_dataset.csv
+topics_dataset.parquet
+*.csv
+*.parquet
