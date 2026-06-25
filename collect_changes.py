@@ -56,12 +56,18 @@ SAFETY_CEILING: int = 50_000
 RAW_DATA_DIR: Path = Path("raw_data")
 
 #: Additional change detail options to request from Gerrit.
+#: UPDATED: Added more options to get detailed data for new features
 GERRIT_OPTIONS: list[str] = [
-    "ALL_REVISIONS",
-    "DETAILED_LABELS",
-    "MESSAGES",
-    "DETAILED_ACCOUNTS",
-    "CURRENT_COMMIT",
+    "ALL_REVISIONS",           # For patchset data
+    "DETAILED_LABELS",         # For Code-Review votes (+2, -2)
+    "MESSAGES",                # For review delays, recheck messages
+    "DETAILED_ACCOUNTS",       # For author/reviewer details
+    "CURRENT_COMMIT",          # For commit details
+    "CURRENT_REVISION",        # For current revision details
+    "DOWNLOAD_COMMANDS",       # Additional metadata
+    "ALL_COMMITS",             # For full commit history
+    "SUBMITTABLE",             # For submission status
+    "WEB_LINKS",               # For external links
 ]
 
 # ---------------------------------------------------------------------------
@@ -319,11 +325,12 @@ def collect_all(dry_run: bool = False) -> None:
     request_counter: list[int] = [0]
 
     print("=" * 70)
-    print("Gerrit Change Collection — pilot phase")
+    print("Gerrit Change Collection — pilot phase (UPDATED WITH NEW FEATURES)")
     print(f"  Projects : {PROJECTS}")
     print(f"  Statuses : {STATUSES}")
     print(f"  After    : {DATE_FROM}")
     print(f"  Page size: {PAGE_SIZE}")
+    print(f"  Options  : {GERRIT_OPTIONS}")
     print("=" * 70)
 
     for project in PROJECTS:

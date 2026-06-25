@@ -40,7 +40,7 @@ OUTPUT_CSV: Path = Path("topics_dataset.csv")
 #: Output Parquet file path
 OUTPUT_PARQUET: Path = Path("topics_dataset.parquet")
 
-#: Topics whose n_changes exceeds this threshold are flagged for manual review.
+#: Topics whose n_changes exceeds this threshold is flagged for manual review.
 LARGE_TOPIC_THRESHOLD: int = 50
 
 #: An open change with no activity for more than this many days is "stale".
@@ -348,6 +348,208 @@ def classify_outcome(
 
 
 # ---------------------------------------------------------------------------
+# NEW FEATURE FUNCTIONS
+# ---------------------------------------------------------------------------
+
+def extract_code_review_labels(change: dict[str, Any]) -> tuple[int, int]:
+    """
+    Extract Code-Review +2 and -2 votes from a change.
+    
+    Parameters
+    ----------
+    change:
+        Single Gerrit change dict.
+        
+    Returns
+    -------
+    tuple[int, int]
+        (count_plus2, count_minus2)
+    """
+    labels: dict[str, Any] = change.get("labels") or {}
+    code_review_info: dict[str, Any] = labels.get("Code-Review") or {}
+    votes: list[dict[str, Any]] = code_review_info.get("all", [])
+    
+    plus2 = 0
+    minus2 = 0
+    
+    for vote in votes:
+        value = vote.get("value", 0)
+        if value == 2:
+            plus2 += 1
+        elif value == -2:
+            minus2 += 1
+    
+    return plus2, minus2
+
+
+def calculate_review_delays(change: dict[str, Any]) -> tuple[float | None, float | None]:
+    """
+    Calculate first review delay and average review delay for a change.
+    
+    Parameters
+    ----------
+    change:
+        Single Gerrit change dict.
+        
+    Returns
+    -------
+    tuple[float | None, float | None]
+        (first_review_delay_hours, avg_review_delay_hours)
+    """
+    created = parse_gerrit_ts(change.get("created"))
+    if not created:
+        return None, None
+    
+    messages: list[dict[str, Any]] = change.get("messages") or []
+    review_times: list[datetime] = []
+    
+    for msg in messages:
+        # Skip messages from the change author (they're not reviews)
+        author = msg.get("author") or {}
+        if author.get("username") == change.get("owner", {}).get("username"):
+            continue
+        
+        msg_time = parse_gerrit_ts(msg.get("date"))
+        if msg_time:
+            review_times.append(msg_time)
+    
+    if not review_times:
+        return None, None
+    
+    # First review delay
+    first_review = min(review_times)
+    first_delay_hours = (first_review - created).total_seconds() / 3600.0
+    
+    # Average review delay (average time from creation to each review)
+    avg_delay_hours = statistics.mean(
+        (t - created).total_seconds() / 3600.0 for t in review_times
+    )
+    
+    return first_delay_hours, avg_delay_hours
+
+
+def get_author_count(change: dict[str, Any]) -> int:
+    """
+    Get the number of authors (contributors) for a change.
+    
+    Parameters
+    ----------
+    change:
+        Single Gerrit change dict.
+        
+    Returns
+    -------
+    int
+        Number of distinct authors who contributed to this change.
+    """
+    authors: set[str] = set()
+    
+    # Owner is an author
+    owner = change.get("owner") or {}
+    if owner.get("email"):
+        authors.add(owner.get("email"))
+    
+    # Check revisions for other authors
+    revisions: dict[str, Any] = change.get("revisions") or {}
+    for rev in revisions.values():
+        uploader = rev.get("uploader") or {}
+        if uploader.get("email"):
+            authors.add(uploader.get("email"))
+    
+    # Check messages for authors
+    messages: list[dict[str, Any]] = change.get("messages") or []
+    for msg in messages:
+        author = msg.get("author") or {}
+        if author.get("email"):
+            authors.add(author.get("email"))
+    
+    return len(authors)
+
+
+def get_active_days(change: dict[str, Any]) -> int | None:
+    """
+    Calculate the number of active days for a change.
+    
+    Parameters
+    ----------
+    change:
+        Single Gerrit change dict.
+        
+    Returns
+    -------
+    int | None
+        Number of days between first and last activity, or None if missing data.
+    """
+    created = parse_gerrit_ts(change.get("created"))
+    updated = parse_gerrit_ts(change.get("updated"))
+    
+    if not created or not updated:
+        return None
+    
+    return (updated - created).days
+
+
+def get_patchset_stats(change: dict[str, Any]) -> tuple[int, int | None]:
+    """
+    Get total patchsets and max patchsets per revision.
+    
+    Parameters
+    ----------
+    change:
+        Single Gerrit change dict.
+        
+    Returns
+    -------
+    tuple[int, int | None]
+        (total_patchsets, max_patchsets_per_revision)
+    """
+    revisions: dict[str, Any] = change.get("revisions") or {}
+    total_patchsets = len(revisions)
+    
+    # Calculate max patchsets per revision (if multiple revisions)
+    max_patchsets = None
+    if revisions:
+        # Count patchsets per file/change within revisions
+        patchset_counts: list[int] = []
+        for rev in revisions.values():
+            # Each revision is a patchset, but we want to count files changed
+            files = rev.get("files") or {}
+            patchset_counts.append(len(files))
+        
+        if patchset_counts:
+            max_patchsets = max(patchset_counts)
+    
+    return total_patchsets, max_patchsets
+
+
+def get_top_author_changes(changes: list[dict[str, Any]]) -> int:
+    """
+    Get the maximum number of changes by a single author in the topic.
+    
+    Parameters
+    ----------
+    changes:
+        List of changes in the topic.
+        
+    Returns
+    -------
+    int
+        Maximum number of changes by one author.
+    """
+    author_counts: dict[str, int] = {}
+    
+    for change in changes:
+        owner = change.get("owner") or {}
+        author = owner.get("email") or owner.get("username") or "unknown"
+        author_counts[author] = author_counts.get(author, 0) + 1
+    
+    if not author_counts:
+        return 0
+    
+    return max(author_counts.values())
+
+
+# ---------------------------------------------------------------------------
 # Per-topic aggregation
 # ---------------------------------------------------------------------------
 
@@ -390,6 +592,16 @@ def aggregate_topic(
 
     ci_rerun_verified_total = 0
     ci_rerun_recheck_total = 0
+    
+    # NEW FEATURE ACCUMULATORS
+    total_code_review_plus2 = 0
+    total_code_review_minus2 = 0
+    first_review_delays: list[float] = []
+    avg_review_delays: list[float] = []
+    active_days_list: list[int] = []
+    total_patchsets_all = 0
+    max_patchsets_all: list[int] = []
+    author_counts: list[int] = []
 
     n_merged = n_abandoned = n_open = 0
 
@@ -426,8 +638,36 @@ def aggregate_topic(
         else:
             n_open += 1
 
+        # CI features
         ci_rerun_verified_total += count_verified_reruns(change, bot_accounts)
         ci_rerun_recheck_total += count_recheck_messages(change)
+        
+        # NEW FEATURE EXTRACTIONS
+        # Code review labels
+        plus2, minus2 = extract_code_review_labels(change)
+        total_code_review_plus2 += plus2
+        total_code_review_minus2 += minus2
+        
+        # Review delays
+        first_delay, avg_delay = calculate_review_delays(change)
+        if first_delay is not None:
+            first_review_delays.append(first_delay)
+        if avg_delay is not None:
+            avg_review_delays.append(avg_delay)
+        
+        # Active days
+        active_days = get_active_days(change)
+        if active_days is not None:
+            active_days_list.append(active_days)
+        
+        # Patchset stats
+        total_ps, max_ps = get_patchset_stats(change)
+        total_patchsets_all += total_ps
+        if max_ps is not None:
+            max_patchsets_all.append(max_ps)
+        
+        # Author count per change
+        author_counts.append(get_author_count(change))
 
     created_at = min(created_dts) if created_dts else None
     last_updated_at = max(updated_dts) if updated_dts else None
@@ -441,7 +681,24 @@ def aggregate_topic(
 
     outcome = classify_outcome(statuses, last_updated_at, now)
 
+    # NEW FEATURE AGGREGATIONS
+    avg_review_delay_hours = statistics.mean(avg_review_delays) if avg_review_delays else None
+    first_review_delay_hours = statistics.mean(first_review_delays) if first_review_delays else None
+    avg_active_days = statistics.mean(active_days_list) if active_days_list else None
+    max_patchsets = max(max_patchsets_all) if max_patchsets_all else None
+    avg_patchsets_per_change = total_patchsets_all / n_changes if n_changes > 0 else 0
+    
+    # CI success/failure counts (already have reruns)
+    ci_successes = ci_rerun_verified_total  # We'll use verified drops as a proxy
+    ci_failures = ci_rerun_recheck_total    # recheck messages as proxy for failures
+    ci_failure_rate = ci_failures / (ci_successes + ci_failures) if (ci_successes + ci_failures) > 0 else 0
+    
+    # Author stats
+    authors_per_change = statistics.mean(author_counts) if author_counts else 0
+    top_author_changes = get_top_author_changes(changes)
+
     return {
+        # ORIGINAL FEATURES
         "topic_id": topic,
         "n_changes": n_changes,
         "n_repos": len(repos),
@@ -462,6 +719,43 @@ def aggregate_topic(
         "outcome": outcome,
         "ci_rerun_verified_drops": ci_rerun_verified_total,
         "ci_rerun_recheck_msgs": ci_rerun_recheck_total,
+        
+        # NEW FEATURES - Review Features
+        "total_code_review_plus2": total_code_review_plus2,
+        "total_code_review_minus2": total_code_review_minus2,
+        "first_review_delay_hours": (
+            round(first_review_delay_hours, 2) if first_review_delay_hours is not None else None
+        ),
+        "avg_review_delay_hours": (
+            round(avg_review_delay_hours, 2) if avg_review_delay_hours is not None else None
+        ),
+        
+        # NEW FEATURES - Temporal Features
+        "last_activity_gap_days": (
+            (now - last_updated_at).days if last_updated_at else None
+        ),
+        "avg_active_days": (
+            round(avg_active_days, 2) if avg_active_days is not None else None
+        ),
+        
+        # NEW FEATURES - Patchset Features
+        "total_patchsets": total_patchsets_all,
+        "avg_patchsets_per_change": round(avg_patchsets_per_change, 2),
+        "max_patchsets": max_patchsets,
+        
+        # NEW FEATURES - CI Features
+        "ci_runs": ci_successes + ci_failures,
+        "ci_successes": ci_successes,
+        "ci_failures": ci_failures,
+        "ci_failure_rate": round(ci_failure_rate, 3),
+        "ci_retries": ci_rerun_verified_total + ci_rerun_recheck_total,
+        
+        # NEW FEATURES - Contributor Features
+        "author_count": len(set(
+            change.get("owner", {}).get("email") or "unknown" for change in changes
+        )),
+        "authors_per_change": round(authors_per_change, 2),
+        "top_author_changes": top_author_changes,
     }
 
 
@@ -470,6 +764,7 @@ def aggregate_topic(
 # ---------------------------------------------------------------------------
 
 _CSV_FIELDS: list[str] = [
+    # ORIGINAL
     "topic_id",
     "n_changes",
     "n_repos",
@@ -486,6 +781,33 @@ _CSV_FIELDS: list[str] = [
     "outcome",
     "ci_rerun_verified_drops",
     "ci_rerun_recheck_msgs",
+    
+    # NEW - Review
+    "total_code_review_plus2",
+    "total_code_review_minus2",
+    "first_review_delay_hours",
+    "avg_review_delay_hours",
+    
+    # NEW - Temporal
+    "last_activity_gap_days",
+    "avg_active_days",
+    
+    # NEW - Patchset
+    "total_patchsets",
+    "avg_patchsets_per_change",
+    "max_patchsets",
+    
+    # NEW - CI
+    "ci_runs",
+    "ci_successes",
+    "ci_failures",
+    "ci_failure_rate",
+    "ci_retries",
+    
+    # NEW - Contributor
+    "author_count",
+    "authors_per_change",
+    "top_author_changes",
 ]
 
 
@@ -539,6 +861,25 @@ def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
         pa.field("outcome", pa.string()),
         pa.field("ci_rerun_verified_drops", pa.int64()),
         pa.field("ci_rerun_recheck_msgs", pa.int64()),
+        
+        # NEW SCHEMA FIELDS
+        pa.field("total_code_review_plus2", pa.int64()),
+        pa.field("total_code_review_minus2", pa.int64()),
+        pa.field("first_review_delay_hours", pa.float64()),
+        pa.field("avg_review_delay_hours", pa.float64()),
+        pa.field("last_activity_gap_days", pa.int64()),
+        pa.field("avg_active_days", pa.float64()),
+        pa.field("total_patchsets", pa.int64()),
+        pa.field("avg_patchsets_per_change", pa.float64()),
+        pa.field("max_patchsets", pa.int64()),
+        pa.field("ci_runs", pa.int64()),
+        pa.field("ci_successes", pa.int64()),
+        pa.field("ci_failures", pa.int64()),
+        pa.field("ci_failure_rate", pa.float64()),
+        pa.field("ci_retries", pa.int64()),
+        pa.field("author_count", pa.int64()),
+        pa.field("authors_per_change", pa.float64()),
+        pa.field("top_author_changes", pa.int64()),
     ])
 
     columns: dict[str, list[Any]] = {field: [] for field in _CSV_FIELDS}
