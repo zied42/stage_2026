@@ -1,14 +1,40 @@
 """
 collect_changes.py
-==================
-Collects raw Gerrit change data for a scoped set of OpenStack projects and
-persists one JSON file per project+status+page under ./raw_data/.
+===================
+Pulls raw change data from a Gerrit instance (default: review.opendev.org)
+via the REST API and caches it to disk as paginated JSON files under
+``raw_data/``, ready for build_topic_dataset.py to consume.
+
+This is step 1 of the pipeline:
+
+    1. collect_changes.py            <- this script (network, resumable)
+    2. build_topic_dataset.py        <- topic-level aggregation (no network)
+    3. extract_advanced_features.py  <- relation chains + snapshot features
 
 Usage:
-    python collect_changes.py [--dry-run]
+    # First run -- scope it with --project/--since or it will try to pull
+    # every change on the whole instance.
+    python collect_changes.py --project openstack/nova --since 2023-01-01
 
-Options:
-    --dry-run   Print the first URL that would be requested and exit immediately.
+    # Re-run later with the SAME query -- picks up where it left off.
+    python collect_changes.py --project openstack/nova --since 2023-01-01
+
+    # Start this query over from scratch.
+    python collect_changes.py --project openstack/nova --fresh
+
+    # Quick test on a small slice before committing to a big pull.
+    python collect_changes.py --project openstack/nova --max-pages 2
+
+Output:
+    raw_data/page_0000.json, raw_data/page_0001.json, ...
+        Each file is the raw JSON array Gerrit returned for one page
+        (after stripping the ")]}'" XSSI-protection prefix), exactly as
+        the API sent it. build_topic_dataset.load_all_changes() consumes
+        these directly via raw_dir.rglob("page_*.json").
+    raw_data/.checkpoint.json
+        Resume state: {"query", "next_start", "next_page", "done"}.
+        Cleared by --fresh. If you change --query/--project/--since
+        between runs without --fresh, the script refuses to mix scopes.
 """
 
 from __future__ import annotations
@@ -23,354 +49,283 @@ from typing import Any
 import requests
 
 # ---------------------------------------------------------------------------
-# Configuration constants — edit these to change the pilot scope
+# Configuration constants
 # ---------------------------------------------------------------------------
 
-#: Gerrit REST API base URL (no trailing slash)
+#: Gerrit instance to query.
 BASE_URL: str = "https://review.opendev.org"
 
-#: Projects to collect.  Use Gerrit's full project name (owner/repo).
-PROJECTS: list[str] = [
-    "openstack/nova",
-    "openstack/neutron",
-    "openstack/cinder",
-    "openstack/keystone",
-]
-
-#: Only fetch changes *created on or after* this date (ISO 8601 date).
-DATE_FROM: str = "2023-01-01"
-
-#: Change statuses to collect.
-STATUSES: list[str] = ["merged", "abandoned", "open"]
-
-#: Maximum number of results Gerrit will return in a single request.
-PAGE_SIZE: int = 500
-
-#: Seconds to sleep between HTTP requests (0.5 – 1.0 recommended).
-REQUEST_DELAY: float = 0.1
-
-#: If the total raw changes collected exceeds this value, warn and pause.
-SAFETY_CEILING: int = 50_000
-
-#: Root directory for persisted raw JSON files.
+#: Output directory -- must match build_topic_dataset.RAW_DATA_DIR.
 RAW_DATA_DIR: Path = Path("raw_data")
 
-#: Additional change detail options to request from Gerrit.
-#: UPDATED: Added more options to get detailed data for new features
-GERRIT_OPTIONS: list[str] = [
-    "ALL_REVISIONS",           # For patchset data
-    "DETAILED_LABELS",         # For Code-Review votes (+2, -2)
-    "MESSAGES",                # For review delays, recheck messages
-    "DETAILED_ACCOUNTS",       # For author/reviewer details
-    "CURRENT_COMMIT",          # For commit details
-    "CURRENT_REVISION",        # For current revision details
-    "DOWNLOAD_COMMANDS",       # Additional metadata
-    "ALL_COMMITS",             # For full commit history
-    "SUBMITTABLE",             # For submission status
-    "WEB_LINKS",               # For external links
-]
+#: Gerrit options requested on every change. These match exactly what
+#: build_topic_dataset.py and extract_advanced_features.py expect to find:
+#:   MESSAGES           -> review delay / CI-rerun / stall features
+#:   DETAILED_LABELS     -> vote details + tags, used for bot detection
+#:   ALL_REVISIONS        -> patchset stats (count, files-changed)
+#:   DETAILED_ACCOUNTS  -> account ids/usernames/emails for contributor features
+#:   CURRENT_FILES        -> files-changed size proxy
+#:   TRACKING_IDS        -> spec/bug references
+GERRIT_OPTIONS: tuple[str, ...] = (
+    "MESSAGES",
+    "DETAILED_LABELS",
+    "ALL_REVISIONS",
+    "DETAILED_ACCOUNTS",
+    "CURRENT_FILES",
+    "TRACKING_IDS",
+)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+#: Max page size Gerrit's REST API will honor (server-enforced ceiling).
+GERRIT_MAX_PAGE_SIZE: int = 500
+
+#: Seconds to sleep between page requests -- be polite to a public instance.
+REQUEST_DELAY: float = 0.5
+
+#: Retry policy for transient network errors.
+MAX_RETRIES: int = 5
+RETRY_BACKOFF_BASE: float = 2.0
 
 _MAGIC_PREFIX = b")]}'\n"
 
 
-def _strip_gerrit_prefix(raw: bytes) -> bytes:
-    """Strip Gerrit's anti-XSSI magic prefix ``)]}'\\n`` if present."""
-    if raw.startswith(_MAGIC_PREFIX):
-        return raw[len(_MAGIC_PREFIX):]
-    return raw
-
-
-def fetch_changes(url: str, session: requests.Session) -> list[dict[str, Any]]:
-    """
-    Perform a single GET request to *url*, strip the Gerrit prefix and
-    deserialise the JSON body.
-
-    Parameters
-    ----------
-    url:
-        Full URL including query string.
-    session:
-        Persistent :class:`requests.Session` instance.
-
-    Returns
-    -------
-    list[dict]
-        Parsed list of Gerrit change objects.
-
-    Raises
-    ------
-    requests.HTTPError
-        If the server returns a non-2xx status code.
-    """
-    response = session.get(url, timeout=30)
-    response.raise_for_status()
-    payload = _strip_gerrit_prefix(response.content)
-    return json.loads(payload)
-
-
-def build_url(project: str, status: str, before: str | None = None) -> str:
-    """
-    Construct the Gerrit ``/changes/`` query URL.
-
-    Parameters
-    ----------
-    project:
-        Gerrit project identifier, e.g. ``openstack/nova``.
-    status:
-        Change status filter: ``merged``, ``abandoned``, or ``open``.
-    before:
-        If given, append ``before:<timestamp>`` to paginate past results
-        already seen.
-
-    Returns
-    -------
-    str
-        Fully-formed URL string ready for an HTTP GET.
-    """
-    query = f"project:{project}+status:{status}+after:{DATE_FROM}"
-    if before:
-        query += f"+before:{before}"
-
-    option_params = "&".join(f"o={opt}" for opt in GERRIT_OPTIONS)
-    url = f"{BASE_URL}/changes/?q={query}&n={PAGE_SIZE}&{option_params}"
-    return url
-
-
-def page_file_path(project: str, status: str, page: int) -> Path:
-    """
-    Return the filesystem path for a given project/status/page combination.
-
-    Parameters
-    ----------
-    project:
-        Gerrit project name (slashes replaced with underscores for safety).
-    status:
-        Change status string.
-    page:
-        1-based page number.
-
-    Returns
-    -------
-    Path
-        Absolute-ish path under :data:`RAW_DATA_DIR`.
-    """
-    safe_project = project.replace("/", "_")
-    return RAW_DATA_DIR / safe_project / status / f"page_{page}.json"
-
-
-def save_page(path: Path, data: list[dict[str, Any]]) -> None:
-    """
-    Persist *data* to *path* as pretty-printed JSON.
-
-    Parameters
-    ----------
-    path:
-        Destination file path.  Parent directories are created automatically.
-    data:
-        List of Gerrit change dicts to serialise.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
-
-
-def _confirm_continue() -> bool:
-    """
-    Ask the operator interactively whether to continue past the safety ceiling.
-
-    Returns
-    -------
-    bool
-        ``True`` if the user consents, ``False`` otherwise.
-    """
-    try:
-        answer = input(
-            "\n⚠  Safety ceiling reached.  Continue collecting? [y/N] "
-        ).strip().lower()
-    except EOFError:
-        answer = "n"
-    return answer in {"y", "yes"}
+def _strip_prefix(raw: bytes) -> bytes:
+    """Strip Gerrit's XSSI-protection prefix from a raw response body."""
+    return raw[len(_MAGIC_PREFIX):] if raw.startswith(_MAGIC_PREFIX) else raw
 
 
 # ---------------------------------------------------------------------------
-# Core collection logic
+# Query construction
 # ---------------------------------------------------------------------------
 
-def collect_project_status(
-    project: str,
-    status: str,
-    session: requests.Session,
-    total_collected: list[int],
-    request_counter: list[int],
-) -> int:
+def build_query(query: str, since: str | None, project: list[str] | None) -> str:
     """
-    Collect all pages of changes for a single *project* + *status* pair.
+    Combine the base query with optional --since / --project filters.
 
-    Pages already persisted on disk are skipped (resumability).
-
-    Parameters
-    ----------
-    project:
-        Gerrit project name.
-    status:
-        Change status (``merged`` / ``abandoned`` / ``open``).
-    session:
-        Shared HTTP session.
-    total_collected:
-        Single-element list used as a mutable counter for the global total.
-    request_counter:
-        Single-element list used as a mutable counter for HTTP requests made.
-
-    Returns
-    -------
-    int
-        Number of changes collected for this project+status pair (new only).
+    Gerrit ANDs space-separated predicates together, so we just append
+    each one (parenthesising the OR'd project list so it binds correctly).
     """
-    page = 1
-    before: str | None = None
-    local_count = 0
-    ceiling_warned = False
+    parts = [query] if query else []
+    if since:
+        parts.append(f"after:{since}")
+    if project:
+        proj_clause = " OR ".join(f"project:{p}" for p in project)
+        parts.append(f"({proj_clause})")
+    return " ".join(parts)
 
-    while True:
-        path = page_file_path(project, status, page)
 
-        # --- Resumability: reuse existing pages ---
-        if path.exists():
-            print(f"  [SKIP] {project} / {status} / page {page} already on disk.")
-            with path.open("r", encoding="utf-8") as fh:
-                changes = json.load(fh)
-            has_more = any(c.get("_more_changes") for c in changes)
-            if changes:
-                before = changes[-1]["updated"]
-            page += 1
-            # Don't add to total_collected for already-cached pages
-            if not has_more:
-                break
-            continue
+# ---------------------------------------------------------------------------
+# Checkpoint handling (resumability)
+# ---------------------------------------------------------------------------
 
-        # --- Fetch ---
-        url = build_url(project, status, before)
+def load_checkpoint(checkpoint_path: Path, query: str) -> dict[str, Any]:
+    """
+    Load resume state if it exists and matches *query*.
+
+    A mismatched query means the on-disk pages were collected for a
+    different scope -- refuse to silently mix them; tell the user to use
+    --fresh or point --output-dir at a new directory instead.
+    """
+    if not checkpoint_path.exists():
+        return {"query": query, "next_start": 0, "next_page": 0, "done": False}
+
+    state = json.loads(checkpoint_path.read_text())
+    if state.get("query") != query:
         print(
-            f"  [FETCH] {project} / {status} / page {page} "
-            f"(request #{request_counter[0] + 1}) …",
-            end="",
-            flush=True,
+            "✗ Existing checkpoint was collected with a DIFFERENT query:\n"
+            f"    on disk : {state.get('query')!r}\n"
+            f"    this run: {query!r}\n"
+            "Refusing to mix scopes. Re-run with --fresh to start over, or "
+            "point --output-dir at a new directory."
         )
+        sys.exit(1)
+    return state
 
+
+def save_checkpoint(checkpoint_path: Path, state: dict[str, Any]) -> None:
+    checkpoint_path.write_text(json.dumps(state, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Fetching
+# ---------------------------------------------------------------------------
+
+def fetch_page(
+    session: requests.Session,
+    query: str,
+    start: int,
+    page_size: int,
+) -> list[dict[str, Any]]:
+    """
+    Fetch a single page of changes starting at offset *start*.
+
+    Retries transient errors (timeouts, 5xx, connection resets) with
+    exponential backoff; raises after MAX_RETRIES.
+    """
+    params: list[tuple[str, str]] = [
+        ("q", query), ("n", str(page_size)), ("S", str(start)),
+    ]
+    for opt in GERRIT_OPTIONS:
+        params.append(("o", opt))
+
+    url = f"{BASE_URL}/changes/"
+    last_exc: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            changes = fetch_changes(url, session)
-        except requests.RequestException as exc:
-            print(f"\n  [ERROR] {exc}")
-            raise
-
-        request_counter[0] += 1
-        save_page(path, changes)
-
-        # Strip the sentinel entry Gerrit uses to signal more pages
-        actual_changes = [c for c in changes if not c.get("_more_changes")]
-        # Gerrit may attach _more_changes to the last real item, not a separate entry
-        has_more = any(c.get("_more_changes") for c in changes)
-
-        count_on_page = len(actual_changes)
-        local_count += count_on_page
-        total_collected[0] += count_on_page
-
-        print(f" {count_on_page} items (total so far: {total_collected[0]})")
-
-        # --- Safety ceiling ---
-        if total_collected[0] >= SAFETY_CEILING and not ceiling_warned:
-            ceiling_warned = True
+            resp = session.get(url, params=params, timeout=60)
+            if resp.status_code >= 500:
+                raise requests.HTTPError(f"{resp.status_code} server error")
+            resp.raise_for_status()
+            return json.loads(_strip_prefix(resp.content))
+        except (requests.RequestException, json.JSONDecodeError) as exc:
+            last_exc = exc
+            wait = RETRY_BACKOFF_BASE ** attempt
             print(
-                f"\n⚠  WARNING: Total raw changes collected has reached "
-                f"{total_collected[0]:,}, which meets or exceeds the "
-                f"safety ceiling of {SAFETY_CEILING:,}."
+                f"  [WARN] attempt {attempt}/{MAX_RETRIES} failed ({exc}); "
+                f"retrying in {wait:.0f}s"
             )
-            if not _confirm_continue():
-                print("Stopping at user request.")
-                sys.exit(0)
+            time.sleep(wait)
 
-        if not has_more or not actual_changes:
-            break
-
-        before = changes[-1]["updated"]
-        page += 1
-        time.sleep(REQUEST_DELAY)
-
-    return local_count
+    raise RuntimeError(
+        f"Giving up on start={start} after {MAX_RETRIES} attempts"
+    ) from last_exc
 
 
-def collect_all(dry_run: bool = False) -> None:
-    """
-    Main entry point: iterate over every configured project and status,
-    collect all pages, and log progress.
+# ---------------------------------------------------------------------------
+# Main collection loop
+# ---------------------------------------------------------------------------
 
-    Parameters
-    ----------
-    dry_run:
-        If ``True``, print the first URL that would be requested and exit.
-    """
-    if dry_run:
-        url = build_url(PROJECTS[0], STATUSES[0])
-        print(f"[DRY RUN] First URL: {url}")
+def collect(
+    query: str,
+    page_size: int,
+    output_dir: Path,
+    max_pages: int | None,
+    fresh: bool,
+) -> None:
+    """Run the full paginated collection loop, resumable across runs."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / ".checkpoint.json"
+
+    if fresh and checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print("Cleared existing checkpoint (--fresh).")
+
+    state = load_checkpoint(checkpoint_path, query)
+    if state["done"]:
+        print(
+            "✓ Collection already marked complete for this query. "
+            "Use --fresh to re-run from scratch."
+        )
         return
 
     session = requests.Session()
     session.headers.update({"Accept": "application/json"})
 
-    total_collected: list[int] = [0]
-    request_counter: list[int] = [0]
+    start_page = state["next_page"]
+    page = start_page
+    start = state["next_start"]
+    n_changes_this_run = 0
 
-    print("=" * 70)
-    print("Gerrit Change Collection — pilot phase (UPDATED WITH NEW FEATURES)")
-    print(f"  Projects : {PROJECTS}")
-    print(f"  Statuses : {STATUSES}")
-    print(f"  After    : {DATE_FROM}")
-    print(f"  Page size: {PAGE_SIZE}")
-    print(f"  Options  : {GERRIT_OPTIONS}")
-    print("=" * 70)
+    print(f"Query : {query!r}")
+    print(f"{'Resuming' if start else 'Starting'} at page={page}, S={start}")
 
-    for project in PROJECTS:
-        for status in STATUSES:
-            print(f"\n→ Collecting {project!r} / {status!r} …")
-            try:
-                n = collect_project_status(
-                    project,
-                    status,
-                    session,
-                    total_collected,
-                    request_counter,
-                )
-                print(f"  ✓ {n} new changes collected for {project}/{status}")
-            except requests.RequestException:
-                print(f"  ✗ Failed for {project}/{status} — skipping.")
+    while True:
+        if max_pages is not None and (page - start_page) >= max_pages:
+            print(f"Reached --max-pages={max_pages}; stopping early (resumable).")
+            break
 
-    print("\n" + "=" * 70)
-    print(f"Collection complete.")
-    print(f"  Total HTTP requests : {request_counter[0]:,}")
-    print(f"  Total changes (new) : {total_collected[0]:,}")
-    print("=" * 70)
+        print(f"Fetching page {page} (S={start}) …")
+        changes = fetch_page(session, query, start, page_size)
+
+        page_path = output_dir / f"page_{page:04d}.json"
+        page_path.write_text(
+            json.dumps(changes, ensure_ascii=False),
+            encoding="utf-8"
+        )
+        n_changes_this_run += len(changes)
+        print(f"  ✓ wrote {len(changes)} changes → {page_path}")
+
+        more = bool(changes) and bool(changes[-1].get("_more_changes"))
+        page += 1
+        start += len(changes)
+
+        save_checkpoint(checkpoint_path, {
+            "query": query,
+            "next_start": start,
+            "next_page": page,
+            "done": not more,
+        })
+
+        if not more:
+            print("✓ No more pages -- collection complete.")
+            break
+
+        time.sleep(REQUEST_DELAY)
+
+    print(f"\nDone. {n_changes_this_run:,} changes fetched this run → {output_dir}/")
+    print("Next: python build_topic_dataset.py")
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Parse CLI arguments and invoke :func:`collect_all`."""
     parser = argparse.ArgumentParser(
-        description="Collect raw Gerrit changes for OpenStack pilot analytics.",
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print the first request URL and exit without fetching.",
+        "--query",
+        default="status:open OR status:merged OR status:abandoned",
+        help=(
+            "Raw Gerrit query string (default: every status, i.e. no "
+            "status filter at all). On a multi-project instance like "
+            "review.opendev.org this is enormous on its own -- scope it "
+            "down with --project and/or --since."
+        ),
+    )
+    parser.add_argument(
+        "--project", action="append", default=None,
+        help=(
+            "Limit to one project (repeatable for multiple), e.g. "
+            "--project openstack/nova --project openstack/keystone"
+        ),
+    )
+    parser.add_argument(
+        "--since", default=None,
+        help="Only changes created after this date, e.g. 2023-01-01",
+    )
+    parser.add_argument(
+        "--page-size", type=int, default=GERRIT_MAX_PAGE_SIZE,
+        help=f"Changes per page (server max {GERRIT_MAX_PAGE_SIZE}).",
+    )
+    parser.add_argument("--output-dir", type=Path, default=RAW_DATA_DIR)
+    parser.add_argument(
+        "--max-pages", type=int, default=None,
+        help=(
+            "Stop after fetching this many pages THIS RUN (resumable -- "
+            "handy for testing on a small slice before a full pull)."
+        ),
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Discard the existing checkpoint and start this query over.",
     )
     args = parser.parse_args()
-    collect_all(dry_run=args.dry_run)
+
+    if args.page_size > GERRIT_MAX_PAGE_SIZE:
+        print(f"--page-size capped at server max {GERRIT_MAX_PAGE_SIZE}")
+        args.page_size = GERRIT_MAX_PAGE_SIZE
+
+    if not args.project and not args.since and args.query.startswith("status:"):
+        print(
+            "⚠  No --project or --since given -- this will try to pull "
+            "every change on the entire instance. Ctrl-C now if that's "
+            "not what you want, or pass --max-pages to test first.\n"
+        )
+
+    full_query = build_query(args.query, args.since, args.project)
+    collect(full_query, args.page_size, args.output_dir, args.max_pages, args.fresh)
 
 
 if __name__ == "__main__":

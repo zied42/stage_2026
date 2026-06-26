@@ -1,5 +1,7 @@
 # raw datasets
 raw_data/
+raw_data_relations/
+test_raw_data/
 *.json
 
 # python cache
@@ -14,4 +16,8 @@ venv/
 topics_dataset.csv
 topics_dataset.parquet
 *.csv
-*.parquet
+*.parquet
+
+# IDE settings
+.idea/
+.vscode/
