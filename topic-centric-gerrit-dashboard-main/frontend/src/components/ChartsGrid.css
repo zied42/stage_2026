@@ -1,0 +1,150 @@
+/* ChartsGrid.css
+   Theme-aware chart styling (works with html[data-theme="dark"])
+*/
+
+:root {
+  /* chart tokens */
+  --grid: rgba(148, 163, 184, 0.35);
+
+  --chart1: #60a5fa;                 /* primary */
+  --chart2: rgba(96, 165, 250, 0.55);
+  --chart3: rgba(96, 165, 250, 0.28);
+  --chart4: rgba(96, 165, 250, 0.18);
+}
+
+/* Dark mode chart tokens (optional but recommended) */
+html[data-theme="dark"] {
+  --grid: rgba(148, 163, 184, 0.22);
+
+  /* a bit brighter in dark mode */
+  --chart1: #60a5fa;
+  --chart2: rgba(96, 165, 250, 0.65);
+  --chart3: rgba(96, 165, 250, 0.35);
+  --chart4: rgba(96, 165, 250, 0.22);
+}
+
+.chartsGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+}
+
+/* Card */
+.chartCard {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Title */
+.chartTitle {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: -0.2px;
+  margin-bottom: 12px;
+}
+
+/* IMPORTANT: this is usually what causes “white inside” in dark mode.
+   Keep it theme-based, not #fff. */
+.chartBody {
+  background: transparent;  /* ✅ let the card theme show through */
+  border-radius: 14px;
+}
+
+/* Empty state */
+.chartEmpty {
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 14px;
+  padding: 14px;
+  color: var(--muted);
+  background: rgba(2, 6, 23, 0.02);
+}
+
+html[data-theme="dark"] .chartEmpty {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+/* Tooltip */
+.chartTooltip {
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  box-shadow: var(--shadow);
+}
+
+.chartTooltipLabel {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.chartTooltipValue {
+  font-size: 14px;
+  font-weight: 900;
+}
+
+/* Make sure recharts text matches theme */
+.recharts-text,
+.recharts-cartesian-axis-tick-value {
+  fill: var(--muted) !important;
+}
+
+/* Optional: make grid lines nicer */
+.recharts-cartesian-grid line {
+  stroke: var(--grid) !important;
+}
+
+/* Responsive */
+@media (max-width: 980px) {
+  .chartsGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.donutLegendRow{
+  display:flex;
+  gap:12px;
+  margin-top:10px;
+}
+
+.donutLegendItem{
+  flex:1;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:10px 12px;
+  border:1px solid rgba(148,163,184,0.18);
+  border-radius:12px;
+  background: rgba(2,6,23,0.02);
+}
+
+html[data-theme="dark"] .donutLegendItem{
+  background: rgba(148,163,184,0.06);
+}
+
+.donutDot{
+  width:10px;
+  height:10px;
+  border-radius:999px;
+}
+
+.donutLegendName{
+  font-weight:800;
+  color: var(--text);
+}
+
+.donutLegendPct{
+  margin-left:auto;
+  color: var(--muted);
+  font-weight:800;
+}
